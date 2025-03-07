@@ -115,8 +115,8 @@ module.exports = function (api) {
         "packages/babel-compat-data",
         "packages/babel-runtime/regenerator"
       );
-      targets = { ie: 7 };
-      needsPolyfillsForOldNode = true;
+      targets = { firefox: "120" };
+      needsPolyfillsForOldNode = false;
       break;
     case "rollup":
       convertESM = false;

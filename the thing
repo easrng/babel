@@ -1,0 +1,2 @@
+STRIP_BABEL_8_FLAG=true BABEL_8_BREAKING=true NODE_ENV=production IS_PUBLISH=1 yarn gulp build-babel-standalone
+then edit the .min.js to remove the extra helper js

@@ -219,23 +219,13 @@ export function validatePlugins(pluginsMap: Map<string, any>) {
 
 // These plugins are defined using a mixin which extends the parser class.
 
-import estree from "./plugins/estree.ts";
-import flow from "./plugins/flow/index.ts";
-import jsx from "./plugins/jsx/index.ts";
 import typescript from "./plugins/typescript/index.ts";
-import placeholders from "./plugins/placeholders.ts";
-import v8intrinsic from "./plugins/v8intrinsic.ts";
 
 // NOTE: order is important. estree must come first; placeholders must come last.
 export const mixinPlugins = {
-  estree,
-  jsx,
-  flow,
   typescript,
-  v8intrinsic,
-  placeholders,
 };
 
-export const mixinPluginNames = Object.keys(mixinPlugins) as ReadonlyArray<
-  "estree" | "jsx" | "flow" | "typescript" | "v8intrinsic" | "placeholders"
->;
+export const mixinPluginNames = Object.keys(
+  mixinPlugins,
+) as ReadonlyArray<"typescript">;

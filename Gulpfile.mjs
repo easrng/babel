@@ -187,8 +187,6 @@ function generateStandalone() {
    * To re-generate run 'yarn gulp generate-standalone'
    */
   ${imports}
-  export const ${exportDecls.slice(0, -1)};
-  export {${exportsList}};
   export const all: { [k: string]: any } = {${allList}};`;
           file.path = "plugins.ts";
           file.contents = Buffer.from(
@@ -754,7 +752,7 @@ const dtsBundles = bool(process.env.BABEL_8_BREAKING)
 const standaloneBundle = [
   {
     src: "packages/babel-standalone",
-    format: "umd",
+    format: "es",
     name: "Babel",
     filename: "babel.js",
     dest: "",
