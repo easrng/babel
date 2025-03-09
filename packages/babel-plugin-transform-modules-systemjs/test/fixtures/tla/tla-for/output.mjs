@@ -1,11 +1,10 @@
 System.register([], function (_export, _context) {
   "use strict";
 
-  var name;
   return {
     setters: [],
-    execute: function () {
-      _export("name", name = _context.id);
+    execute: async function () {
+      for await (const x of test) {}
     }
   };
 });

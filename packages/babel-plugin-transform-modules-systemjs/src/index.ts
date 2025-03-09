@@ -1,11 +1,7 @@
 import { declare } from "@babel/helper-plugin-utils";
 import { template, types as t } from "@babel/core";
 import type { PluginPass, NodePath, Scope, Visitor } from "@babel/core";
-import {
-  buildDynamicImport,
-  getModuleName,
-  rewriteThis,
-} from "@babel/helper-module-transforms";
+import { getModuleName, rewriteThis } from "@babel/helper-module-transforms";
 import type { PluginOptions } from "@babel/helper-module-transforms";
 import { isIdentifierName } from "@babel/helper-validator-identifier";
 
@@ -17,12 +13,12 @@ const buildTemplate = template.statement(`
       setters: SETTERS,
       execute: EXECUTE,
     };
-  });
+  }, METAS);
 `);
 
 const buildExportAll = template.statement(`
   for (var KEY in TARGET) {
-    if (KEY !== "default" && KEY !== "__esModule") EXPORT_OBJ[KEY] = TARGET[KEY];
+    if (KEY !== "default") EXPORT_OBJ[KEY] = TARGET[KEY];
   }
 `);
 
@@ -74,10 +70,80 @@ type PluginState = {
   stringSpecifiers: Set<string>;
 };
 
+type ModuleIdentity = {
+  source: string;
+  assert: [string, string][] | null;
+  with: [string, string][] | null;
+};
+function moduleIdentity(
+  node:
+    | t.ExportAllDeclaration
+    | (t.ExportNamedDeclaration & { source: t.StringLiteral })
+    | t.ImportDeclaration,
+): ModuleIdentity {
+  return {
+    source: node.source.value,
+    assert: node.assertions?.length
+      ? node.assertions.map(e => [
+          t.isIdentifier(e.key) ? e.key.name : e.key.value,
+          e.value.value,
+        ])
+      : null,
+    with: node.attributes?.length
+      ? node.attributes.map(e => [
+          t.isIdentifier(e.key) ? e.key.name : e.key.value,
+          e.value.value,
+        ])
+      : null,
+  };
+}
+function moduleAttributesEqual(
+  a: [string, string][] | null,
+  b: [string, string][] | null,
+) {
+  if (a === b) return true;
+  if (
+    (a === null && b !== null) ||
+    (a !== null && b === null) ||
+    a.length !== b.length
+  )
+    return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i][0] !== b[i][0] || a[i][1] !== b[i][1]) return false;
+  }
+  return true;
+}
+function moduleIdentitiesEqual(a: ModuleIdentity, b: ModuleIdentity) {
+  return (
+    a === b ||
+    (a.source === b.source &&
+      moduleAttributesEqual(a.assert, b.assert) &&
+      moduleAttributesEqual(a.with, b.with))
+  );
+}
+
 type ModuleMetadata = {
-  key: string;
-  imports: any[];
-  exports: any[];
+  source: string;
+  assert: [string, string][] | null;
+  with: [string, string][] | null;
+  imports: (
+    | t.ImportDefaultSpecifier
+    | t.ImportNamespaceSpecifier
+    | t.ImportSpecifier
+  )[];
+  exports: (
+    | {
+        type: "ExportSpecifier";
+        local: t.Identifier | t.StringLiteral;
+        exported: t.Identifier | t.StringLiteral;
+      }
+    | {
+        type: "ExportNamespaceSpecifier";
+        exported: t.Identifier | t.StringLiteral;
+      }
+    | t.ExportDefaultSpecifier
+    | t.ExportAllDeclaration
+  )[];
 };
 
 function constructExportCall(
@@ -170,7 +236,7 @@ export interface Options extends PluginOptions {
 
 type ReassignmentVisitorState = {
   scope: Scope;
-  exports: any;
+  exports: Record<string, string[]>;
   buildCall: (name: string, value: t.Expression) => t.ExpressionStatement;
 };
 
@@ -224,20 +290,15 @@ export default declare<PluginState>((api, options: Options) => {
       // if it is a non-prefix update expression (x++ etc)
       // then we must replace with the expression (_export('x', x + 1), x++)
       // in order to ensure the same update expression value
-      const isPostUpdateExpression = t.isUpdateExpression(node, {
-        prefix: false,
-      });
-      if (isPostUpdateExpression) {
+      let isPostUpdateExpression;
+      if (
+        (isPostUpdateExpression = t.isUpdateExpression(node, {
+          prefix: false,
+        }))
+      ) {
         node = t.binaryExpression(
-          // @ts-expect-error The operator of a post-update expression must be "++" | "--"
-          node.operator[0],
-          t.unaryExpression(
-            "+",
-            t.cloneNode(
-              // @ts-expect-error node is UpdateExpression
-              node.argument,
-            ),
-          ),
+          node.operator === "++" ? "+" : "-",
+          t.unaryExpression("+", t.cloneNode(node.argument)),
           t.numericLiteral(1),
         );
       }
@@ -284,14 +345,14 @@ export default declare<PluginState>((api, options: Options) => {
           }
         }
         path.replaceWith(
-          buildDynamicImport(path.node, false, true, specifier =>
-            t.callExpression(
-              t.memberExpression(
-                t.identifier(state.contextIdent),
-                t.identifier("import"),
-              ),
-              [specifier],
+          t.callExpression(
+            t.memberExpression(
+              t.identifier(state.contextIdent),
+              t.identifier("import"),
             ),
+            path.node.type === "CallExpression"
+              ? path.node.arguments
+              : [path.node.source].concat(path.node.options || []),
           ),
         );
       },
@@ -305,20 +366,6 @@ export default declare<PluginState>((api, options: Options) => {
             t.memberExpression(
               t.identifier(state.contextIdent),
               t.identifier("meta"),
-            ),
-          );
-        }
-      },
-
-      ReferencedIdentifier(path, state) {
-        if (
-          path.node.name === "__moduleName" &&
-          !path.scope.hasBinding("__moduleName")
-        ) {
-          path.replaceWith(
-            t.memberExpression(
-              t.identifier(state.contextIdent),
-              t.identifier("id"),
             ),
           );
         }
@@ -342,7 +389,8 @@ export default declare<PluginState>((api, options: Options) => {
 
           const beforeBody = [];
           const setters: t.Expression[] = [];
-          const sources: t.StringLiteral[] = [];
+          const dependencies: ModuleIdentity[] = [];
+          let dependenciesNeedMetas = false;
           const variableIds = [];
           const removedPaths = [];
 
@@ -352,22 +400,49 @@ export default declare<PluginState>((api, options: Options) => {
           }
 
           function pushModule(
-            source: string,
-            key: "imports" | "exports",
-            specifiers: t.ModuleSpecifier[] | t.ExportAllDeclaration,
-          ) {
+            ...[identity, key, specifiers]:
+              | [
+                  /* identity */ ModuleIdentity,
+                  /* key */ "imports",
+                  /* specifiers */ (
+                    | t.ImportDefaultSpecifier
+                    | t.ImportNamespaceSpecifier
+                    | t.ImportSpecifier
+                  )[],
+                ]
+              | [
+                  /* identity */ ModuleIdentity,
+                  /* key */ "exports",
+                  /* specifiers */ specifiers: (
+                    | t.ExportSpecifier
+                    | t.ExportNamespaceSpecifier
+                    | t.ExportDefaultSpecifier
+                    | t.ExportAllDeclaration
+                  )[],
+                ]
+          ): void {
             let module: ModuleMetadata;
             modules.forEach(function (m) {
-              if (m.key === source) {
+              if (moduleIdentitiesEqual(m, identity)) {
                 module = m;
               }
             });
             if (!module) {
               modules.push(
-                (module = { key: source, imports: [], exports: [] }),
+                (module = {
+                  source: identity.source,
+                  assert: identity.assert,
+                  with: identity.with,
+                  imports: [],
+                  exports: [],
+                }),
               );
             }
-            module[key] = module[key].concat(specifiers);
+            if (key === "imports") {
+              module[key] = module[key].concat(specifiers);
+            } else {
+              module[key] = module[key].concat(specifiers);
+            }
           }
 
           function buildExportCall(name: string, val: t.Expression) {
@@ -404,15 +479,18 @@ export default declare<PluginState>((api, options: Options) => {
               // because they must be hoisted
               path.node.kind = "var";
             } else if (path.isImportDeclaration()) {
-              const source = path.node.source.value;
-              pushModule(source, "imports", path.node.specifiers);
+              pushModule(
+                moduleIdentity(path.node),
+                "imports",
+                path.node.specifiers,
+              );
               for (const name of Object.keys(path.getBindingIdentifiers())) {
                 scope.removeBinding(name);
                 variableIds.push(t.identifier(name));
               }
               path.remove();
             } else if (path.isExportAllDeclaration()) {
-              pushModule(path.node.source.value, "exports", path.node);
+              pushModule(moduleIdentity(path.node), "exports", [path.node]);
               path.remove();
             } else if (path.isExportDefaultDeclaration()) {
               const declar = path.node.declaration;
@@ -450,7 +528,7 @@ export default declare<PluginState>((api, options: Options) => {
                 }
                 removedPaths.push(path);
               } else {
-                // @ts-expect-error TSDeclareFunction is not expected here
+                if (t.isTSDeclareFunction(declar)) t.assertExpression(declar);
                 path.replaceWith(buildExportCall("default", declar));
               }
             } else if (path.isExportNamedDeclaration()) {
@@ -497,34 +575,70 @@ export default declare<PluginState>((api, options: Options) => {
                 const specifiers = path.node.specifiers;
                 if (specifiers?.length) {
                   if (path.node.source) {
-                    pushModule(path.node.source.value, "exports", specifiers);
+                    pushModule(
+                      moduleIdentity(
+                        path.node as typeof path.node & {
+                          source: t.StringLiteral;
+                        },
+                      ),
+                      "exports",
+                      specifiers,
+                    );
                     path.remove();
                   } else {
                     const nodes = [];
 
                     for (const specifier of specifiers) {
-                      // @ts-expect-error This isn't an "export ... from" declaration
-                      // because path.node.source is falsy, so the local specifier exists.
+                      t.assertExportSpecifier(specifier);
                       const { local, exported } = specifier;
 
-                      const binding = scope.getBinding(local.name);
-                      const exportedName = getExportSpecifierName(
-                        exported,
-                        stringSpecifiers,
-                      );
-                      // hoisted function export
-                      if (
-                        binding &&
-                        t.isFunctionDeclaration(binding.path.node)
-                      ) {
-                        exportNames.push(exportedName);
-                        exportValues.push(t.cloneNode(local));
+                      let wasImported = false;
+                      for (const module of modules) {
+                        for (const importSpecifier of module.imports) {
+                          if (importSpecifier.local.name === local.name) {
+                            module.exports.push(
+                              t.isImportNamespaceSpecifier(importSpecifier)
+                                ? {
+                                    type: "ExportNamespaceSpecifier",
+                                    exported: t.cloneNode(exported),
+                                  }
+                                : {
+                                    type: "ExportSpecifier",
+                                    local: t.isImportDefaultSpecifier(
+                                      importSpecifier,
+                                    )
+                                      ? t.identifier("default")
+                                      : t.cloneNode(importSpecifier.imported),
+                                    exported: t.cloneNode(exported),
+                                  },
+                            );
+                            wasImported = true;
+                            break;
+                          }
+                        }
+                        if (wasImported) break;
                       }
-                      // only globals also exported this way
-                      else if (!binding) {
-                        nodes.push(buildExportCall(exportedName, local));
+
+                      if (!wasImported) {
+                        const binding = scope.getBinding(local.name);
+                        const exportedName = getExportSpecifierName(
+                          exported,
+                          stringSpecifiers,
+                        );
+                        // hoisted function export
+                        if (
+                          binding &&
+                          t.isFunctionDeclaration(binding.path.node)
+                        ) {
+                          exportNames.push(exportedName);
+                          exportValues.push(t.cloneNode(local));
+                        }
+                        // only globals also exported this way
+                        else if (!binding) {
+                          nodes.push(buildExportCall(exportedName, local));
+                        }
+                        addExportName(local.name, exportedName);
                       }
-                      addExportName(local.name, exportedName);
                     }
 
                     path.replaceWithMultiple(nodes);
@@ -538,9 +652,9 @@ export default declare<PluginState>((api, options: Options) => {
 
           modules.forEach(function (specifiers) {
             const setterBody = [];
-            const target = scope.generateUid(specifiers.key);
+            const target = scope.generateUid(specifiers.source);
 
-            for (let specifier of specifiers.imports) {
+            for (const specifier of specifiers.imports) {
               if (t.isImportNamespaceSpecifier(specifier)) {
                 setterBody.push(
                   t.expressionStatement(
@@ -551,15 +665,13 @@ export default declare<PluginState>((api, options: Options) => {
                     ),
                   ),
                 );
-              } else if (t.isImportDefaultSpecifier(specifier)) {
-                specifier = t.importSpecifier(
-                  specifier.local,
-                  t.identifier("default"),
-                );
-              }
-
-              if (t.isImportSpecifier(specifier)) {
-                const { imported } = specifier;
+              } else if (
+                t.isImportSpecifier(specifier) ||
+                t.isImportDefaultSpecifier(specifier)
+              ) {
+                const imported = t.isImportDefaultSpecifier(specifier)
+                  ? t.identifier("default")
+                  : specifier.imported;
                 setterBody.push(
                   t.expressionStatement(
                     t.assignmentExpression(
@@ -567,12 +679,15 @@ export default declare<PluginState>((api, options: Options) => {
                       specifier.local,
                       t.memberExpression(
                         t.identifier(target),
-                        specifier.imported,
+                        imported,
                         /* computed */ imported.type === "StringLiteral",
                       ),
                     ),
                   ),
                 );
+              } else {
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const _typeAssertion: never = specifier;
               }
             }
 
@@ -582,9 +697,9 @@ export default declare<PluginState>((api, options: Options) => {
               let hasExportStar = false;
 
               for (const node of specifiers.exports) {
-                if (t.isExportAllDeclaration(node)) {
+                if (node.type === "ExportAllDeclaration") {
                   hasExportStar = true;
-                } else if (t.isExportSpecifier(node)) {
+                } else if (node.type === "ExportSpecifier") {
                   const exportedName = getExportSpecifierName(
                     node.exported,
                     stringSpecifiers,
@@ -597,8 +712,29 @@ export default declare<PluginState>((api, options: Options) => {
                       t.isStringLiteral(node.local),
                     ),
                   );
+                } else if (node.type === "ExportNamespaceSpecifier") {
+                  const exportedName = getExportSpecifierName(
+                    node.exported,
+                    stringSpecifiers,
+                  );
+                  exportNames.push(exportedName);
+                  exportValues.push(t.identifier(target));
+                } else if (node.type === "ExportDefaultSpecifier") {
+                  const exportedName = getExportSpecifierName(
+                    node.exported,
+                    stringSpecifiers,
+                  );
+                  exportNames.push(exportedName);
+                  exportValues.push(
+                    t.memberExpression(
+                      t.identifier(target),
+                      t.identifier("default"),
+                      false,
+                    ),
+                  );
                 } else {
-                  // todo
+                  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                  const _typeAssertion: never = node;
                 }
               }
 
@@ -614,7 +750,10 @@ export default declare<PluginState>((api, options: Options) => {
               );
             }
 
-            sources.push(t.stringLiteral(specifiers.key));
+            dependencies.push(specifiers);
+            if (specifiers.assert || specifiers.with) {
+              dependenciesNeedMetas = true;
+            }
             setters.push(
               t.functionExpression(
                 null,
@@ -624,9 +763,7 @@ export default declare<PluginState>((api, options: Options) => {
             );
           });
 
-          let moduleName = getModuleName(this.file.opts, options);
-          // @ts-expect-error todo(flow->ts): do not reuse variables
-          if (moduleName) moduleName = t.stringLiteral(moduleName);
+          const moduleName = getModuleName(this.file.opts, options);
 
           if (!process.env.BABEL_8_BREAKING && !USE_ESM && !IS_STANDALONE) {
             // polyfill when being run by an older Babel version
@@ -683,6 +820,10 @@ export default declare<PluginState>((api, options: Options) => {
               hasTLA = true;
               path.stop();
             },
+            ForAwaitStatement() {
+              hasTLA = true;
+              path.stop();
+            },
             Function(path) {
               path.skip();
             },
@@ -697,7 +838,7 @@ export default declare<PluginState>((api, options: Options) => {
                 t.identifier("register"),
               ),
               BEFORE_BODY: beforeBody,
-              MODULE_NAME: moduleName,
+              MODULE_NAME: moduleName ? t.stringLiteral(moduleName) : null,
               SETTERS: t.arrayExpression(setters),
               EXECUTE: t.functionExpression(
                 null,
@@ -706,7 +847,51 @@ export default declare<PluginState>((api, options: Options) => {
                 false,
                 hasTLA,
               ),
-              SOURCES: t.arrayExpression(sources),
+              SOURCES: t.arrayExpression(
+                dependencies.map(e => t.stringLiteral(e.source)),
+              ),
+              METAS: dependenciesNeedMetas
+                ? t.arrayExpression(
+                    dependencies.map(e =>
+                      e.assert || e.with
+                        ? t.objectExpression(
+                            (e.assert
+                              ? [
+                                  t.objectProperty(
+                                    t.identifier("assert"),
+                                    t.objectExpression(
+                                      e.assert.map(e =>
+                                        t.objectProperty(
+                                          t.stringLiteral(e[0]),
+                                          t.stringLiteral(e[1]),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ]
+                              : []
+                            ).concat(
+                              e.with
+                                ? [
+                                    t.objectProperty(
+                                      t.identifier("with"),
+                                      t.objectExpression(
+                                        e.with.map(e =>
+                                          t.objectProperty(
+                                            t.stringLiteral(e[0]),
+                                            t.stringLiteral(e[1]),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ]
+                                : [],
+                            ),
+                          )
+                        : t.buildUndefinedNode(),
+                    ),
+                  )
+                : null,
               EXPORT_IDENTIFIER: t.identifier(exportIdent),
               CONTEXT_IDENTIFIER: t.identifier(contextIdent),
             }),
